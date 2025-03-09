@@ -2,6 +2,7 @@ import openai
 import os
 import requests
 import json
+import http.client
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -18,6 +19,25 @@ MAKCORPS_API_URL = "https://api.makcorps.com/booking"
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GOOGLE_PLACES_API_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
+RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST")
+
+# RapidAPI Connection Test
+
+def test_rapidapi_connection():
+    """Test RapidAPI connection with basic endpoint."""
+    conn = http.client.HTTPSConnection("booking-com.p.rapidapi.com")
+    headers = {
+        'x-rapidapi-key': RAPIDAPI_KEY,
+        'x-rapidapi-host': RAPIDAPI_HOST
+    }
+    conn.request("GET", "/v1/metadata/exchange-rates?locale=en-us&currency=USD", headers=headers)
+    res = conn.getresponse()
+    data = res.read()
+    print("\n🔍 RapidAPI Connection Test Response:")
+    print(data.decode("utf-8"))
+
 
 # Set up OpenAI client
 client = openai.AzureOpenAI(
@@ -168,75 +188,106 @@ import re
 #         print("Error parsing GPT-4o function response:", e)
 #         return None
 
-def get_hotel_names_from_llm(location):
-    """Uses GPT-4o to generate a list of hotel names in a given location."""
-    system_prompt = f"Generate a list of well-known hotels in {location}. Provide only names, no descriptions."
+# Function to let LLM parse user query naturally
+def extract_query_details_from_llm(user_query):
+    system_prompt = """
+    You are an assistant that extracts hotel search details from user requests. 
+    Extract location, check-in date, check-out date, and budget if mentioned. 
+    Dates must be formatted as YYYY-MM-DD. 
+    Respond only with JSON in this format: 
+    {"location": "city name", "checkin": "YYYY-MM-DD", "checkout": "YYYY-MM-DD", "budget": 150} 
+    If budget is not mentioned, set it as null.
+    """
     response = client.chat.completions.create(
         model=AZURE_DEPLOYMENT_NAME,
         messages=[
-            {"role": "system", "content": system_prompt}
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_query}
         ],
-        temperature=0.7,
-        max_tokens=200
+        temperature=0.2,
+        max_tokens=300
     )
-    hotel_names = response.choices[0].message.content.strip().split("\n")
-    return [hotel.strip() for hotel in hotel_names if hotel.strip()]
+    content = response.choices[0].message.content.strip()
+    content = content.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(content)
+    except Exception as e:
+        print("Failed to parse LLM response:", content)
+        print("Parsing error:", e)
+        return None
 
-def get_hotel_details_from_user():
-    """Interactively asks the user for hotel search details."""
-    location = input("Where would you like to book a hotel? ").strip()
-    budget = input("What is your budget per night (in USD)? ").strip()
-    amenities = input("Any specific amenities you are looking for? (e.g., pool, wifi, gym) ").strip()
-    checkin = input("Enter check-in date (YYYY-MM-DD): ").strip()
-    checkout = input("Enter check-out date (YYYY-MM-DD): ").strip()
-
-    # Convert budget to integer if provided
-    budget = int(budget) if budget.isdigit() else None
-    amenities = [a.strip().lower() for a in amenities.split(',')] if amenities else []
-
-    return {
-        "location": location,
-        "budget": budget,
-        "amenities": amenities,
-        "checkin": checkin,
-        "checkout": checkout
+# Function to get destination ID for RapidAPI hotel search
+def get_destination_id(city_name):
+    url = "https://booking-com.p.rapidapi.com/v1/hotels/locations"
+    headers = {
+        'x-rapidapi-key': RAPIDAPI_KEY,
+        'x-rapidapi-host': RAPIDAPI_HOST
     }
+    params = {"name": city_name, "locale": "en-us"}
+    response = requests.get(url, headers=headers, params=params)
+    print(f"\n🔍 Destination ID API Response: {response.text}")
+    if response.status_code == 200:
+        data = response.json()
+        if data:
+            dest_id = data[0].get("dest_id")
+            print(f"✅ Fetched Destination ID for {city_name}: {dest_id}")
+            return dest_id
+    return None
 
-def get_hotel_prices_using_llm(hotel_details, currency="USD", adults=2, rooms=1, kids=0):
-    """Uses LLM-generated hotel names to query Makcorps API and filter results based on user criteria."""
-    country = "us"  # Default country, can be modified to support multiple regions
-    hotel_names = get_hotel_names_from_llm(hotel_details["location"])
-    valid_hotels = []
+def get_hotel_prices_via_rapidapi(hotel_details, adults=2, rooms=1):
+    location = hotel_details["location"]
+    checkin = hotel_details["checkin"]
+    checkout = hotel_details["checkout"]
+    budget = hotel_details.get("budget")
 
-    for hotel_name in hotel_names:
-        params = {
-            "country": country,
-            "hotelid": hotel_name,
-            "checkin": hotel_details["checkin"],
-            "checkout": hotel_details["checkout"],
-            "currency": currency,
-            "adults": adults,
-            "rooms": rooms,
-            "kids": kids,
-            "api_key": MAKCORPS_API_KEY
-        }
-        
-        response = requests.get(MAKCORPS_API_URL, params=params)
-        if response.status_code == 200:
-            hotel_data = response.json()
-            # Filter results based on budget and amenities
-            if hotel_data and isinstance(hotel_data, dict):
-                for result in hotel_data.get("hotels", []):
-                    price = result.get("price", float("inf"))
-                    hotel_amenities = result.get("amenities", [])
-                    if (hotel_details["budget"] is None or price <= hotel_details["budget"]) and all(a in hotel_amenities for a in hotel_details["amenities"]):
-                        valid_hotels.append(result)
-    
-    return valid_hotels if valid_hotels else "No hotels found matching your criteria."
+    dest_id = get_destination_id(location)
+    if not dest_id:
+        return "Could not find hotels in that location."
 
-# Interactive Mode for Selecting and Using Agents
+    url = "https://booking-com.p.rapidapi.com/v1/hotels/search"
+    headers = {
+        'x-rapidapi-key': RAPIDAPI_KEY,
+        'x-rapidapi-host': RAPIDAPI_HOST
+    }
+    params = {
+        "checkin_date": checkin,
+        "checkout_date": checkout,
+        "dest_id": dest_id,
+        "dest_type": "city",
+        "adults_number": adults,
+        "room_number": rooms,
+        "order_by": "price",
+        "currency": "USD",  # Hardcoded
+        "locale": "en-us",
+        "filter_by_currency": "USD",  # Hardcoded
+        "units": "metric"  # Hardcoded as metric
+    }
+    response = requests.get(url, headers=headers, params=params)
+    print(f"\n🔍 Hotel Search API Response: {response.text}")
+    if response.status_code != 200:
+        return f"Error: API request failed. {response.status_code}: {response.text}"
+
+    data = response.json()
+    filtered_hotels = []
+    for hotel in data.get("result", []):
+        price = hotel.get("min_total_price", float("inf"))
+        if budget is None or price <= budget:
+            filtered_hotels.append({
+                "name": hotel.get("hotel_name"),
+                "price": price,
+                "address": hotel.get("address", "No address"),
+                "rating": hotel.get("review_score", "No rating"),
+                "url": hotel.get("url", "No URL")
+            })
+
+    return filtered_hotels if filtered_hotels else "No hotels found matching your criteria."
+
+# Main interactive loop
 if __name__ == "__main__":
     print("Multi-Agent GPT-4o System (Type 'exit' to quit)")
+
+    # Test connection to RapidAPI at startup
+    test_rapidapi_connection()
 
     while True:
         print("\nSelect an agent:")
@@ -259,27 +310,37 @@ if __name__ == "__main__":
 
         while True:
             try:
-                user_input = input("\nYou: ")
-                if user_input.lower() == "exit":
+                user_query = input("\nYou: ")
+                if user_query.lower() == "exit":
                     break
 
-                if agent_choice == "3":  # If the Travel Agent is selected
-                    hotel_details = get_hotel_details_from_user()
-                    print(f"\nFetching live hotel prices for {hotel_details['location']}...")
-                    hotels_prices = get_hotel_prices_using_llm(hotel_details)
-                    print("\nGPT-4o (Hotel Prices):", json.dumps(hotels_prices, indent=4))
+                if agent_choice == "3":
+                    hotel_details = extract_query_details_from_llm(user_query)
+                    if not hotel_details:
+                        print("❌ Could not extract details. Please try again.")
+                        continue
+                    print(f"\n📍 Searching hotels in {hotel_details['location']} from {hotel_details['checkin']} to {hotel_details['checkout']}")
+                    if hotel_details['budget']:
+                        print(f"💰 Budget: ${hotel_details['budget']} per night")
+                    hotels = get_hotel_prices_via_rapidapi(hotel_details)
+                    print("\n🏨 Hotel Options:")
+                    if isinstance(hotels, str):
+                        print(hotels)
+                    else:
+                        for idx, hotel in enumerate(hotels, start=1):
+                            print(f"{idx}. {hotel['name']} - ${hotel['price']} - {hotel['rating']} stars")
+                            print(f"   Address: {hotel['address']}\n   URL: {hotel['url']}\n")
                 else:
                     response = client.chat.completions.create(
                         model=AZURE_DEPLOYMENT_NAME,
                         messages=[
                             {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_input}
+                            {"role": "user", "content": user_query}
                         ],
                         temperature=0.7,
                         max_tokens=500
                     )
                     print("\nGPT-4o:", response.choices[0].message.content)
-
             except KeyboardInterrupt:
                 print("\nExiting... Goodbye!")
                 break
