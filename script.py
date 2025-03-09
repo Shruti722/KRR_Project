@@ -36,7 +36,7 @@ def test_rapidapi_connection():
     res = conn.getresponse()
     data = res.read()
     print("\n🔍 RapidAPI Connection Test Response:")
-    print(data.decode("utf-8"))
+    # print(data.decode("utf-8"))
 
 
 # Set up OpenAI client
@@ -239,6 +239,7 @@ def get_hotel_prices_via_rapidapi(hotel_details, adults=2, rooms=1):
     checkin = hotel_details["checkin"]
     checkout = hotel_details["checkout"]
     budget = hotel_details.get("budget")
+    amenities = hotel_details.get("amenities", [])  # New for amenities
 
     dest_id = get_destination_id(location)
     if not dest_id:
@@ -257,13 +258,12 @@ def get_hotel_prices_via_rapidapi(hotel_details, adults=2, rooms=1):
         "adults_number": adults,
         "room_number": rooms,
         "order_by": "price",
-        "currency": "USD",  # Hardcoded
+        "currency": "USD",
         "locale": "en-us",
-        "filter_by_currency": "USD",  # Hardcoded
-        "units": "metric"  # Hardcoded as metric
+        "filter_by_currency": "USD",
+        "units": "metric"
     }
     response = requests.get(url, headers=headers, params=params)
-    print(f"\n🔍 Hotel Search API Response: {response.text}")
     if response.status_code != 200:
         return f"Error: API request failed. {response.status_code}: {response.text}"
 
@@ -271,16 +271,49 @@ def get_hotel_prices_via_rapidapi(hotel_details, adults=2, rooms=1):
     filtered_hotels = []
     for hotel in data.get("result", []):
         price = hotel.get("min_total_price", float("inf"))
-        if budget is None or price <= budget:
-            filtered_hotels.append({
-                "name": hotel.get("hotel_name"),
-                "price": price,
-                "address": hotel.get("address", "No address"),
-                "rating": hotel.get("review_score", "No rating"),
-                "url": hotel.get("url", "No URL")
-            })
+        hotel_amenities = hotel.get("hotel_facilities", "")
+        is_free_cancellable = hotel.get("is_free_cancellable", 0)
+        
+        if budget is not None and price > budget:
+            continue
+        
+        if amenities:
+            if not all(amenity.lower() in hotel_amenities.lower() for amenity in amenities):
+                continue
+
+        filtered_hotels.append({
+            "name": hotel.get("hotel_name"),
+            "price": price,
+            "address": hotel.get("address", "No address"),
+            "rating": hotel.get("review_score", "No rating"),
+            "url": hotel.get("url", "No URL"),
+            "free_cancellation": "Yes" if is_free_cancellable else "No"
+        })
 
     return filtered_hotels if filtered_hotels else "No hotels found matching your criteria."
+
+# Helper function to get only minimal details from the result
+def get_destination_id(city_name):
+    url = "https://booking-com.p.rapidapi.com/v1/hotels/locations"
+    headers = {
+        'x-rapidapi-key': RAPIDAPI_KEY,
+        'x-rapidapi-host': RAPIDAPI_HOST
+    }
+    params = {"name": city_name, "locale": "en-us"}
+    response = requests.get(url, headers=headers, params=params)
+    if response.status_code == 200:
+        data = response.json()
+        for entry in data:
+            if entry.get("dest_type") == "city":
+                dest_id = entry.get("dest_id")
+                print(f"✅ Fetched City Destination ID for {city_name}: {dest_id}")
+                return dest_id
+        if data:
+            dest_id = data[0].get("dest_id")
+            print(f"⚠️ Fallback Destination ID for {city_name}: {dest_id}")
+            return dest_id
+    return None
+
 
 # Main interactive loop
 if __name__ == "__main__":
