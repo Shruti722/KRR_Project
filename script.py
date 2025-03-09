@@ -168,83 +168,71 @@ import re
 #         print("Error parsing GPT-4o function response:", e)
 #         return None
 
-def extract_query_parameters(user_query):
-    """Extracts structured search parameters from user input using regex and GPT validation."""
-    location_match = re.search(r"in ([A-Za-z\s]+)", user_query, re.IGNORECASE)
-    budget_match = re.search(r"under \$?(\d+)", user_query, re.IGNORECASE)
-    amenities_match = re.findall(r"(infinity pool|spa|wifi|beachfront|gym|restaurant)", user_query, re.IGNORECASE)
+def get_hotel_names_from_llm(location):
+    """Uses GPT-4o to generate a list of hotel names in a given location."""
+    system_prompt = f"Generate a list of well-known hotels in {location}. Provide only names, no descriptions."
+    response = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_NAME,
+        messages=[
+            {"role": "system", "content": system_prompt}
+        ],
+        temperature=0.7,
+        max_tokens=200
+    )
+    hotel_names = response.choices[0].message.content.strip().split("\n")
+    return [hotel.strip() for hotel in hotel_names if hotel.strip()]
 
-    location = location_match.group(1).strip() if location_match else "Unknown"
-    budget = int(budget_match.group(1)) if budget_match else None
-    amenities = [amenity.lower() for amenity in amenities_match] if amenities_match else []
+def get_hotel_details_from_user():
+    """Interactively asks the user for hotel search details."""
+    location = input("Where would you like to book a hotel? ").strip()
+    budget = input("What is your budget per night (in USD)? ").strip()
+    amenities = input("Any specific amenities you are looking for? (e.g., pool, wifi, gym) ").strip()
+    checkin = input("Enter check-in date (YYYY-MM-DD): ").strip()
+    checkout = input("Enter check-out date (YYYY-MM-DD): ").strip()
 
-    return {"location": location, "budget": budget, "amenities": amenities}
+    # Convert budget to integer if provided
+    budget = int(budget) if budget.isdigit() else None
+    amenities = [a.strip().lower() for a in amenities.split(',')] if amenities else []
 
-
-def find_hotels_with_google(location, amenities):
-    """Fetch hotels from Google Places API based on GPT-4o extracted location and amenities."""
-    search_query = f"hotels in {location}"
-    if amenities:
-        search_query += f" with {', '.join(amenities)}"
-
-    params = {
-        "query": search_query,
-        "key": GOOGLE_API_KEY
-    }
-
-    response = requests.get(GOOGLE_PLACES_API_URL, params=params)
-    data = response.json()
-
-    if "results" not in data or not data["results"]:
-        return f"No hotels found matching your criteria in {location}.", []
-
-    hotel_list = []
-    for hotel in data["results"][:5]:  # Limit to 5 results
-        name = hotel.get("name", "Unknown Hotel")
-        place_id = hotel.get("place_id", "N/A")  
-        address = hotel.get("formatted_address", "No address available")
-        rating = hotel.get("rating", "No rating available")
-        hotel_list.append({"name": name, "place_id": place_id, "address": address, "rating": rating})
-
-    return f"Here are some hotels in {location}:", hotel_list
-
-
-def get_hotel_prices(country, hotel_name, checkin, checkout, currency="USD", adults=2, rooms=1, kids=0):
-    """Fetch live hotel prices using Makcorps API."""
-    params = {
-        "country": country,
-        "hotelid": hotel_name,
+    return {
+        "location": location,
+        "budget": budget,
+        "amenities": amenities,
         "checkin": checkin,
-        "checkout": checkout,
-        "currency": currency,
-        "adults": adults,
-        "rooms": rooms,
-        "kids": kids,
-        "api_key": MAKCORPS_API_KEY
+        "checkout": checkout
     }
 
-    response = requests.get(MAKCORPS_API_URL, params=params)
+def get_hotel_prices_using_llm(hotel_details, currency="USD", adults=2, rooms=1, kids=0):
+    """Uses LLM-generated hotel names to query Makcorps API and filter results based on user criteria."""
+    country = "us"  # Default country, can be modified to support multiple regions
+    hotel_names = get_hotel_names_from_llm(hotel_details["location"])
+    valid_hotels = []
+
+    for hotel_name in hotel_names:
+        params = {
+            "country": country,
+            "hotelid": hotel_name,
+            "checkin": hotel_details["checkin"],
+            "checkout": hotel_details["checkout"],
+            "currency": currency,
+            "adults": adults,
+            "rooms": rooms,
+            "kids": kids,
+            "api_key": MAKCORPS_API_KEY
+        }
+        
+        response = requests.get(MAKCORPS_API_URL, params=params)
+        if response.status_code == 200:
+            hotel_data = response.json()
+            # Filter results based on budget and amenities
+            if hotel_data and isinstance(hotel_data, dict):
+                for result in hotel_data.get("hotels", []):
+                    price = result.get("price", float("inf"))
+                    hotel_amenities = result.get("amenities", [])
+                    if (hotel_details["budget"] is None or price <= hotel_details["budget"]) and all(a in hotel_amenities for a in hotel_details["amenities"]):
+                        valid_hotels.append(result)
     
-    if response.status_code != 200:
-        return f"Error: API request failed with status code {response.status_code}"
-
-    return response.json()
-
-def chat_with_gpt(prompt, system_message):
-    """Sends a prompt to GPT-4o and returns the response."""
-    try:
-        response = client.chat.completions.create(
-            model=AZURE_DEPLOYMENT_NAME,
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=500
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"Error: {e}"
+    return valid_hotels if valid_hotels else "No hotels found matching your criteria."
 
 # Interactive Mode for Selecting and Using Agents
 if __name__ == "__main__":
@@ -276,34 +264,21 @@ if __name__ == "__main__":
                     break
 
                 if agent_choice == "3":  # If the Travel Agent is selected
-                    city = user_input.strip().title()
-                    print("\nSearching for hotels in", city, "...")
-                    message, hotels = find_hotels_with_google(city, [])
-
-                    print("\nGPT-4o (Hotels Found):")
-                    print(message)
-                    for idx, hotel in enumerate(hotels, start=1):
-                        print(f"{idx}. {hotel['name']} - {hotel['rating']} stars - {hotel['address']}")
-
-                    if not hotels:
-                        continue
-
-                    hotel_choice = int(input("\nEnter the number of the hotel to fetch prices: ")) - 1
-                    if hotel_choice < 0 or hotel_choice >= len(hotels):
-                        print("Invalid selection.")
-                        continue
-
-                    hotel_selected = hotels[hotel_choice]["name"]
-                    country = input("Enter country (e.g., us, uk): ").strip().lower()
-                    checkin = input("Enter check-in date (YYYY-MM-DD): ").strip()
-                    checkout = input("Enter check-out date (YYYY-MM-DD): ").strip()
-
-                    print(f"\nFetching live hotel prices for {hotel_selected}...")
-                    hotels_prices = get_hotel_prices(country, hotel_selected, checkin, checkout)
-                    print("\nGPT-4o (Hotel Prices):", hotels_prices)
+                    hotel_details = get_hotel_details_from_user()
+                    print(f"\nFetching live hotel prices for {hotel_details['location']}...")
+                    hotels_prices = get_hotel_prices_using_llm(hotel_details)
+                    print("\nGPT-4o (Hotel Prices):", json.dumps(hotels_prices, indent=4))
                 else:
-                    response = chat_with_gpt(user_input, system_prompt)
-                    print("\nGPT-4o:", response)
+                    response = client.chat.completions.create(
+                        model=AZURE_DEPLOYMENT_NAME,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_input}
+                        ],
+                        temperature=0.7,
+                        max_tokens=500
+                    )
+                    print("\nGPT-4o:", response.choices[0].message.content)
 
             except KeyboardInterrupt:
                 print("\nExiting... Goodbye!")
