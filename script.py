@@ -5,6 +5,7 @@ import json
 import http.client
 from dotenv import load_dotenv
 
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -14,11 +15,11 @@ AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME")
 AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2023-05-15")
 
-MAKCORPS_API_KEY = os.getenv("MAKCORPS_API_KEY")
-MAKCORPS_API_URL = "https://api.makcorps.com/booking"
+# MAKCORPS_API_KEY = os.getenv("MAKCORPS_API_KEY")
+# MAKCORPS_API_URL = "https://api.makcorps.com/booking"
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GOOGLE_PLACES_API_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+# GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+# GOOGLE_PLACES_API_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
 
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
 RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST")
@@ -45,6 +46,12 @@ client = openai.AzureOpenAI(
     api_version=AZURE_API_VERSION,
     azure_endpoint=AZURE_OPENAI_ENDPOINT
 )
+evaluator_client = openai.AzureOpenAI(
+    api_key=AZURE_OPENAI_API_KEY, 
+    api_version=AZURE_API_VERSION,  
+    azure_endpoint=AZURE_OPENAI_ENDPOINT
+)
+
 
 # Define three different agents with unique system prompts
 AGENTS = {
@@ -52,22 +59,23 @@ AGENTS = {
         "description": "Case 1: Giving more than the required number of outputs.",
         "system_message": """You are an AI assistant that follows user instructions precisely.
 
-        - When a user requests a single result, return exactly one and no more.
+        - When a user requests a certain number of results, return exactly that many and no more.
         - Do not assume the user wants additional recommendations unless explicitly stated.
         - If multiple possible answers exist, choose the most relevant one based on context, instead of listing multiple options.
         - If clarification is needed, ask instead of assuming.
         - Prioritize precision over over-explaining or expanding the response unnecessarily.
+        - When giving an answer, explain briefly WHY you chose that option based on relevant factors (like price, ratings, amenities, distance). 
 
         Examples:
 
         User: "Give me just one affordable hotel in New York."
-        AI: "Sure! The most affordable hotel in New York is Hotel A."
+        AI: "Sure! The most affordable hotel in New York is Hotel A. I analyzed several affordable hotels based on price, ratings, and amenities, and selected Hotel A because it has the best combination of low price and high guest ratings (4.5/5)."
 
         User: "Find a nearby restaurant."
-        AI: "I recommend Joe's Diner, a well-rated spot close to your location."
+        AI: "I recommend Joe's Diner, a well-rated spot close to your location. I analyzed several nearby hotels based on price, ratings, and amenities, and selected Joe's Diner because it has the best combination of low price and high guest ratings (4.5/5)."
 
         User: "Give me a hotel in San Francisco under $100."
-        AI: "Based on affordability and reviews, I suggest The Budget Inn."
+        AI: "Based on affordability and reviews, I suggest The Budget Inn. I checked the pricing of all hotels and this seemed the best one that fell under your budget"
 
         Do not provide multiple answers unless explicitly asked for.
         Do not add unnecessary options or alternatives.
@@ -84,6 +92,7 @@ AGENTS = {
         - Ensure that your responses are relevant, concise, and aligned with the user's intent.
         - If multiple interpretations exist for a query, offer clarification questions instead of making assumptions.
         - If the user asks for a default recommendation (e.g., "give me some options"), use general best practices or popular choices, but explicitly state that the user can refine their request.
+        - When giving an answer, explain WHY you chose that option based on relevant factors (like price, ratings, amenities, distance).
 
         Examples:
 
@@ -103,7 +112,11 @@ AGENTS = {
 
     "3": {
         "description": "Case 3: Not giving updated outputs.",
-        "system_message": "You are a travel assistant. Extract user preferences and fetch real-time hotel prices based on location, budget, and amenities."
+        "system_message": """"You are an AI assistant that provides accurate and context-aware responses to user queries. 
+
+        - Dont give more than 5 options for each query and make sure the options are relevant. 
+        - You are using an API so you can return realtime imformation to the user.
+        - When giving an answer, explain WHY you chose that option based on relevant factors (like price, ratings, amenities, distance)."""
     }
 }
 
@@ -194,9 +207,10 @@ def extract_query_details_from_llm(user_query):
     You are an assistant that extracts hotel search details from user requests. 
     Extract location, check-in date, check-out date, and budget if mentioned. 
     Dates must be formatted as YYYY-MM-DD. 
-    Respond only with JSON in this format: 
+    Respond only with valid JSON without any explanation or extra text, like this: 
     {"location": "city name", "checkin": "YYYY-MM-DD", "checkout": "YYYY-MM-DD", "budget": 150} 
-    If budget is not mentioned, set it as null.
+    If budget is not mentioned, set it as null. No explanations, no comments.
+
     """
     response = client.chat.completions.create(
         model=AZURE_DEPLOYMENT_NAME,
@@ -239,7 +253,7 @@ def get_hotel_prices_via_rapidapi(hotel_details, adults=2, rooms=1):
     checkin = hotel_details["checkin"]
     checkout = hotel_details["checkout"]
     budget = hotel_details.get("budget")
-    amenities = hotel_details.get("amenities", [])  # New for amenities
+    amenities = hotel_details.get("amenities", [])  
 
     dest_id = get_destination_id(location)
     if not dest_id:
@@ -314,12 +328,52 @@ def get_destination_id(city_name):
             return dest_id
     return None
 
+def evaluator_llm_check(user_query, agent_output, agent_number):
+    """
+    Function to use the deployed Evaluator LLM to check if an agent's output makes sense.
 
-# Main interactive loop
+    Args:
+        user_query (str): The user's input question.
+        agent_output (str or list): The output generated by the agent.
+        agent_number (int): Number of the agent (1, 2, 3).
+
+    Returns:
+        str: Evaluation result as given by Evaluator LLM.
+    """
+    evaluation_prompt = f"""
+    You are an expert AI output evaluator. Your task is to assess whether an AI agent's response properly answers the user's question.
+
+    User Query: "{user_query}"
+
+    Agent Number: {agent_number}
+
+    Agent Output: "{agent_output}"
+
+    Check if the output makes sense, is relevant to the user's request, and aligns with the expected behavior of the agent. 
+    Be concise in your feedback.
+
+    If the answer is good and fully appropriate, respond with: "Valid".
+    If the answer has issues, explain clearly in 1-2 sentences what is wrong.
+
+    If the user says no other specifications then the agent should be giving a reply without asking more questions.
+    """
+
+    response = evaluator_client.chat.completions.create(
+        model="gpt-4o",  # Evaluator LLM deployment name
+        messages=[
+            {"role": "system", "content": "You are an evaluator that verifies AI agent outputs."},
+            {"role": "user", "content": evaluation_prompt}
+        ],
+        temperature=0.2,
+        max_tokens=300
+    )
+
+
+    return response.choices[0].message.content.strip()
+
 if __name__ == "__main__":
     print("Multi-Agent GPT-4o System (Type 'exit' to quit)")
 
-    # Test connection to RapidAPI at startup
     test_rapidapi_connection()
 
     while True:
@@ -336,44 +390,33 @@ if __name__ == "__main__":
             print("Invalid choice. Please select a valid agent.")
             continue
 
-        # Get the selected system message
-        agent_info = AGENTS[agent_choice]
-        system_prompt = agent_info["system_message"]
-        print(f"\nSelected Agent: {agent_info['description']}")
+        system_prompt = AGENTS[agent_choice]["system_message"]
+        print(f"\nSelected Agent: {AGENTS[agent_choice]['description']}")
 
         while True:
-            try:
-                user_query = input("\nYou: ")
-                if user_query.lower() == "exit":
-                    break
-
-                if agent_choice == "3":
-                    hotel_details = extract_query_details_from_llm(user_query)
-                    if not hotel_details:
-                        print("❌ Could not extract details. Please try again.")
-                        continue
-                    print(f"\n📍 Searching hotels in {hotel_details['location']} from {hotel_details['checkin']} to {hotel_details['checkout']}")
-                    if hotel_details['budget']:
-                        print(f"💰 Budget: ${hotel_details['budget']} per night")
-                    hotels = get_hotel_prices_via_rapidapi(hotel_details)
-                    print("\n🏨 Hotel Options:")
-                    if isinstance(hotels, str):
-                        print(hotels)
-                    else:
-                        for idx, hotel in enumerate(hotels, start=1):
-                            print(f"{idx}. {hotel['name']} - ${hotel['price']} - {hotel['rating']} stars")
-                            print(f"   Address: {hotel['address']}\n   URL: {hotel['url']}\n")
-                else:
-                    response = client.chat.completions.create(
-                        model=AZURE_DEPLOYMENT_NAME,
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_query}
-                        ],
-                        temperature=0.7,
-                        max_tokens=500
-                    )
-                    print("\nGPT-4o:", response.choices[0].message.content)
-            except KeyboardInterrupt:
-                print("\nExiting... Goodbye!")
+            user_query = input("\nYou: ")
+            if user_query.lower() == "exit":
                 break
+
+            if agent_choice == "3":
+                # Travel Assistant flow
+                hotel_details = extract_query_details_from_llm(user_query)
+                hotels = get_hotel_prices_via_rapidapi(hotel_details)
+                result = evaluator_llm_check(user_query, hotels, 3)
+                print("\n Hotel Options:", json.dumps(hotels, indent=2))
+                print("\n Evaluator Check:", result)
+
+            else:
+                response = client.chat.completions.create(
+                    model=AZURE_DEPLOYMENT_NAME,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_query}
+                    ],
+                    temperature=0.7,
+                    max_tokens=500
+                )
+                output = response.choices[0].message.content
+                result = evaluator_llm_check(user_query, output, int(agent_choice))
+                print("\nGPT-4o:", output)
+                print("\n Evaluator Check:", result)
