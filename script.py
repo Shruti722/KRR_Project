@@ -350,12 +350,12 @@ def evaluator_llm_check(user_query, agent_output, agent_number):
     Agent Output: "{agent_output}"
 
     Check if the output makes sense, is relevant to the user's request, and aligns with the expected behavior of the agent. 
-    Be concise in your feedback.
+    Be concise in your feedback. Also give a Chain of Reasoning to explain how to came to that conclusion.
 
     If the answer is good and fully appropriate, respond with: "Valid".
     If the answer has issues, explain clearly in 1-2 sentences what is wrong.
 
-    If the user says no other specifications then the agent should be giving a reply without asking more questions.
+    If the user says "no other specifications" then the agent should be giving a reply without asking more questions.
     """
 
     response = evaluator_client.chat.completions.create(
